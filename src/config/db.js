@@ -6,16 +6,22 @@ try {
 } catch (e) {}
 
 let mongoMemoryServer = null;
+let cachedConn = null;
 
 export const connectDB = async () => {
+  if (cachedConn && mongoose.connection.readyState >= 1) {
+    return cachedConn;
+  }
+
   const uri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/santrino_db';
 
   try {
-    // Attempt connecting to the configured URI with a 3 second timeout
+    // Attempt connecting to the configured URI
     const conn = await mongoose.connect(uri, {
-      serverSelectionTimeoutMS: 3000,
+      serverSelectionTimeoutMS: 5000,
     });
     console.log(`✅ MongoDB Connected to Local/Atlas: ${conn.connection.host}`);
+    cachedConn = conn;
     await autoSeedIfEmpty();
     return conn;
   } catch (error) {

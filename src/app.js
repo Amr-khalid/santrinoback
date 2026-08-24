@@ -14,16 +14,30 @@ dotenv.config();
 
 const app = express();
 
-// Connect Database
+// Connect Database on startup
 connectDB();
 
-// Middleware
+// Ensure DB is connected for every serverless request
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    next(err);
+  }
+});
+
+// CORS configuration to accept any origin
 app.use(
   cors({
-    origin: '*',
+    origin: (origin, callback) => callback(null, true), // Allow all origins dynamically
     credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
   })
 );
+app.options('*', cors());
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 if (process.env.NODE_ENV === 'development') {
@@ -46,6 +60,13 @@ app.use('/api/bookings', bookingRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/superadmin', superadminRoutes);
 
+// Root route for Vercel
+app.get('/', (req, res) => {
+  res.json({
+    status: 'online',
+    message: 'Santrino Backend API is running smoothly on Vercel',
+  });
+});
 
 // 404 Handler
 app.use((req, res) => {
@@ -60,8 +81,11 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, () => {
-  console.log(`🚀 Santrino Server running on http://localhost:${PORT}`);
-});
+// Only listen locally, avoid listening on Vercel serverless environment
+if (process.env.NODE_ENV !== 'production' || !process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`🚀 Santrino Server running on http://localhost:${PORT}`);
+  });
+}
 
 export default app;
