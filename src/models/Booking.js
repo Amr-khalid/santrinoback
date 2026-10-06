@@ -2,10 +2,36 @@ import mongoose from 'mongoose';
 
 const bookingSchema = new mongoose.Schema(
   {
+    venue: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Venue',
+      index: true,
+    },
+    facility: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Facility',
+      index: true,
+    },
     field: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Field',
-      required: true,
+      default: null,
+      index: true,
+    },
+    activityType: {
+      type: String,
+      default: 'football',
+      index: true,
+    },
+    bookingType: {
+      type: String,
+      enum: ['time_slot', 'session'],
+      default: 'time_slot',
+    },
+    participantsCount: {
+      type: Number,
+      default: 1,
+      min: 1,
     },
     user: {
       type: mongoose.Schema.Types.ObjectId,
@@ -15,6 +41,7 @@ const bookingSchema = new mongoose.Schema(
     dateString: {
       type: String, // Format: "YYYY-MM-DD" for accurate timezone-safe comparison
       required: [true, 'تاريخ الحجز مطلوب'],
+      index: true,
     },
     startTime: {
       type: String, // "18:00"
@@ -42,6 +69,7 @@ const bookingSchema = new mongoose.Schema(
       type: String,
       enum: ['pending_confirmation', 'confirmed', 'cancelled', 'auto_expired', 'completed'],
       default: 'confirmed',
+      index: true,
     },
     batchId: {
       type: String,
@@ -79,12 +107,14 @@ const bookingSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-// Compound Unique Index to prevent double bookings (active bookings only)
+// Compound index for time_slot bookings to ensure exclusivity
 bookingSchema.index(
-  { field: 1, dateString: 1, startTime: 1 },
+  { facility: 1, dateString: 1, startTime: 1 },
   {
-    unique: true,
-    partialFilterExpression: { status: { $nin: ['cancelled', 'auto_expired'] } },
+    partialFilterExpression: {
+      bookingType: 'time_slot',
+      status: { $nin: ['cancelled', 'auto_expired'] },
+    },
   }
 );
 

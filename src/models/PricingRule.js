@@ -2,10 +2,22 @@ import mongoose from 'mongoose';
 
 const pricingRuleSchema = new mongoose.Schema(
   {
+    facility: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Facility',
+      default: null,
+      index: true,
+    },
     field: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Field',
-      required: true,
+      default: null,
+      index: true,
+    },
+    venue: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Venue',
+      default: null,
     },
     name: {
       type: String,

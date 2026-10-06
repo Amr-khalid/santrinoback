@@ -4,6 +4,9 @@ import morgan from 'morgan';
 import dotenv from 'dotenv';
 import { connectDB } from './config/db.js';
 import authRoutes from './routes/auth.routes.js';
+import venueRoutes from './routes/venue.routes.js';
+import facilityRoutes from './routes/facility.routes.js';
+import activityRoutes from './routes/activity.routes.js';
 import fieldRoutes from './routes/field.routes.js';
 import bookingRoutes from './routes/booking.routes.js';
 import dashboardRoutes from './routes/dashboard.routes.js';
@@ -48,13 +51,16 @@ if (process.env.NODE_ENV === 'development') {
 app.get('/api/health', (req, res) => {
   res.json({
     status: 'online',
-    system: 'Santrino Smart Field Booking API',
+    system: 'Santrino Sports & Activities Booking Platform API',
     timestamp: new Date().toISOString(),
   });
 });
 
 // API Routes
 app.use('/api/auth', authRoutes);
+app.use('/api/venues', venueRoutes);
+app.use('/api/facilities', facilityRoutes);
+app.use('/api/activities', activityRoutes);
 app.use('/api/fields', fieldRoutes);
 app.use('/api/bookings', bookingRoutes);
 app.use('/api/dashboard', dashboardRoutes);

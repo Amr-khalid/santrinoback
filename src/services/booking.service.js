@@ -1,5 +1,7 @@
 import crypto from 'crypto';
+import Facility from '../models/Facility.js';
 import Field from '../models/Field.js';
+import Venue from '../models/Venue.js';
 import Booking from '../models/Booking.js';
 import { generateTimeSlots } from '../utils/timeSlots.js';
 import { calculateSlotPrice } from './pricing.service.js';
@@ -74,42 +76,111 @@ export function getConfirmationPolicyDetails(dateString, startTime, bookingSourc
 }
 
 /**
+ * Helper to fetch target facility or field with venue context
+ */
+async function resolveFacilityOrField(targetId) {
+  let facility = await Facility.findById(targetId).populate('venue');
+  if (facility) {
+    return {
+      isFacility: true,
+      target: facility,
+      venue: facility.venue,
+      facilityId: facility._id,
+      fieldId: null,
+      name: facility.name,
+      activityType: facility.activityType,
+      bookingType: facility.bookingType || 'time_slot',
+      capacity: facility.capacity || (facility.bookingType === 'session' ? 20 : 1),
+      operatingHours: facility.operatingHours || { open: '08:00', close: '24:00' },
+      slotDurationMinutes: facility.slotDurationMinutes || 60,
+      location: facility.venue?.location,
+    };
+  }
+
+  const field = await Field.findById(targetId);
+  if (field) {
+    return {
+      isFacility: false,
+      target: field,
+      venue: null,
+      facilityId: null,
+      fieldId: field._id,
+      name: field.name,
+      activityType: 'football',
+      bookingType: 'time_slot',
+      capacity: 1,
+      operatingHours: field.operatingHours || { open: '08:00', close: '24:00' },
+      slotDurationMinutes: field.slotDurationMinutes || 60,
+      location: field.location,
+    };
+  }
+
+  return null;
+}
+
+/**
  * Get all slots for a given date with availability and dynamic pricing
  */
-export async function getSlotsWithAvailability(fieldId, dateString) {
-  // Always clean up expired bookings before fetching slots
+export async function getSlotsWithAvailability(targetId, dateString) {
   await expireStaleBookings();
 
-  const field = await Field.findById(fieldId);
-  if (!field) {
-    throw new Error('الملعب غير موجود');
+  const resolved = await resolveFacilityOrField(targetId);
+  if (!resolved) {
+    throw new Error('المنشأة أو الملعب غير موجود');
   }
+
+  const { target, venue, facilityId, fieldId, bookingType, capacity, operatingHours, slotDurationMinutes } = resolved;
 
   // Generate slots
   const allSlots = generateTimeSlots(
-    field.operatingHours.open,
-    field.operatingHours.close,
-    field.slotDurationMinutes || 60
+    operatingHours.open || '08:00',
+    operatingHours.close || '24:00',
+    slotDurationMinutes || 60
   );
 
-  // Fetch all active bookings for this field on this date (not cancelled or auto_expired)
-  const bookings = await Booking.find({
-    field: fieldId,
+  // Fetch active bookings for this facility/field on this date
+  const query = {
     dateString,
     status: { $nin: ['cancelled', 'auto_expired'] },
-  }).select('startTime endTime status playerName playerPhone confirmationDeadline');
+  };
+  if (facilityId) {
+    query.$or = [{ facility: facilityId }, { field: targetId }];
+  } else {
+    query.field = fieldId;
+  }
 
-  const bookedSlotsMap = new Map();
+  const bookings = await Booking.find(query).select(
+    'startTime endTime status playerName playerPhone confirmationDeadline participantsCount bookingType'
+  );
+
+  // Group bookings by slot startTime
+  const bookingsBySlot = new Map();
   bookings.forEach((b) => {
-    bookedSlotsMap.set(b.startTime, b);
+    const list = bookingsBySlot.get(b.startTime) || [];
+    list.push(b);
+    bookingsBySlot.set(b.startTime, list);
   });
 
   // Attach pricing & availability
   const enrichedSlots = await Promise.all(
     allSlots.map(async (slot) => {
-      const isBooked = bookedSlotsMap.has(slot.startTime);
-      const bookingData = bookedSlotsMap.get(slot.startTime);
-      const pricing = await calculateSlotPrice(fieldId, dateString, slot.startTime);
+      const slotBookings = bookingsBySlot.get(slot.startTime) || [];
+      const pricing = await calculateSlotPrice(targetId, dateString, slot.startTime);
+
+      let isAvailable = true;
+      let bookedCount = 0;
+      let remainingSlots = capacity;
+
+      if (bookingType === 'session') {
+        bookedCount = slotBookings.reduce((sum, b) => sum + (b.participantsCount || 1), 0);
+        remainingSlots = Math.max(0, capacity - bookedCount);
+        isAvailable = remainingSlots > 0;
+      } else {
+        // Exclusive court/time_slot
+        isAvailable = slotBookings.length === 0;
+        bookedCount = slotBookings.length > 0 ? 1 : 0;
+        remainingSlots = isAvailable ? 1 : 0;
+      }
 
       return {
         startTime: slot.startTime,
@@ -117,14 +188,18 @@ export async function getSlotsWithAvailability(fieldId, dateString) {
         displayTime: slot.displayTime,
         price: pricing.price,
         appliedRule: pricing.appliedRule,
-        isAvailable: !isBooked,
-        bookingInfo: isBooked
+        bookingType,
+        capacity,
+        bookedCount,
+        remainingSlots,
+        isAvailable,
+        bookingInfo: slotBookings.length > 0
           ? {
-              id: bookingData._id,
-              status: bookingData.status,
-              playerName: bookingData.playerName,
-              playerPhone: bookingData.playerPhone,
-              confirmationDeadline: bookingData.confirmationDeadline,
+              id: slotBookings[0]._id,
+              status: slotBookings[0].status,
+              playerName: slotBookings[0].playerName,
+              playerPhone: slotBookings[0].playerPhone,
+              participantsCount: bookedCount,
             }
           : null,
       };
@@ -132,13 +207,32 @@ export async function getSlotsWithAvailability(fieldId, dateString) {
   );
 
   return {
+    facility: {
+      id: target._id,
+      name: target.name,
+      activityType: resolved.activityType,
+      bookingType,
+      capacity,
+      defaultHourlyPrice: target.defaultHourlyPrice,
+      operatingHours,
+      location: resolved.location,
+      venue: venue
+        ? {
+            id: venue._id,
+            name: venue.name,
+            location: venue.location,
+            phone: venue.phone,
+          }
+        : null,
+    },
+    // Also include 'field' for legacy compatibility
     field: {
-      id: field._id,
-      name: field.name,
-      fieldType: field.fieldType,
-      defaultHourlyPrice: field.defaultHourlyPrice,
-      operatingHours: field.operatingHours,
-      location: field.location,
+      id: target._id,
+      name: target.name,
+      fieldType: target.subType || target.fieldType || '5v5',
+      defaultHourlyPrice: target.defaultHourlyPrice,
+      operatingHours,
+      location: resolved.location,
     },
     dateString,
     slots: enrichedSlots,
@@ -149,17 +243,30 @@ export async function getSlotsWithAvailability(fieldId, dateString) {
  * Create a new booking with conflict check, confirmation policy, and rate limiting
  */
 export async function createBooking({
+  facilityId,
   fieldId,
   dateString,
   startTime,
   endTime,
   playerName,
   playerPhone,
+  participantsCount = 1,
   userId = null,
   bookingSource = 'online',
   notes = '',
 }) {
   await expireStaleBookings();
+
+  const targetId = facilityId || fieldId;
+  const resolved = await resolveFacilityOrField(targetId);
+  if (!resolved) {
+    const err = new Error('المنشأة أو الملعب غير موجود');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const { target, venue, bookingType, capacity, activityType } = resolved;
+  const count = Math.max(1, parseInt(participantsCount, 10) || 1);
 
   // Rate Limiting: Max 3 pending confirmation bookings per phone number
   if (bookingSource === 'online') {
@@ -168,40 +275,57 @@ export async function createBooking({
       status: 'pending_confirmation',
     });
     if (pendingCount >= 3) {
-      const error = new Error('لديك 3 حجوزات معلقة بانتظار التأكيد، يرجى تأكيدها أو إلغاؤها قبل إضافة حجوزات جديدة');
+      const error = new Error('لديك 3 حجوزات معلقة بانتظار التأكيد، يرجى تأكيدها أو إلغاؤها أولاً');
       error.statusCode = 400;
       throw error;
     }
   }
 
-  // Check if slot is already booked
-  const existingBooking = await Booking.findOne({
-    field: fieldId,
+  // Conflict / Capacity check
+  const activeBookings = await Booking.find({
+    $or: [{ facility: target._id }, { field: target._id }],
     dateString,
     startTime,
     status: { $nin: ['cancelled', 'auto_expired'] },
   });
 
-  if (existingBooking) {
-    const error = new Error('هذا الموعد تم حجزه بالفعل، يرجى اختيار موعد آخر');
-    error.statusCode = 409;
-    throw error;
+  if (bookingType === 'session') {
+    const totalBooked = activeBookings.reduce((sum, b) => sum + (b.participantsCount || 1), 0);
+    const available = capacity - totalBooked;
+    if (count > available) {
+      const error = new Error(`المقاعد المتبقية في هذه الجلسة (${available}) غير كافية لطلبك (${count})`);
+      error.statusCode = 409;
+      throw error;
+    }
+  } else {
+    // Exclusive time_slot
+    if (activeBookings.length > 0) {
+      const error = new Error('هذا الموعد تم حجزه بالفعل، يرجى اختيار موعد آخر');
+      error.statusCode = 409;
+      throw error;
+    }
   }
 
   // Calculate dynamic price & confirmation policy
-  const { price, appliedRule } = await calculateSlotPrice(fieldId, dateString, startTime);
+  const { price: unitPrice, appliedRule } = await calculateSlotPrice(target._id, dateString, startTime);
+  const totalPrice = bookingType === 'session' ? unitPrice * count : unitPrice;
   const policy = getConfirmationPolicyDetails(dateString, startTime, bookingSource);
   const batchId = 'batch_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
 
   const newBooking = await Booking.create({
-    field: fieldId,
+    venue: venue ? venue._id : null,
+    facility: resolved.isFacility ? target._id : null,
+    field: !resolved.isFacility ? target._id : null,
+    activityType,
+    bookingType,
+    participantsCount: count,
     user: userId,
     dateString,
     startTime,
     endTime,
     playerName,
     playerPhone,
-    price,
+    price: totalPrice,
     bookingSource,
     notes,
     batchId,
@@ -219,19 +343,32 @@ export async function createBooking({
 }
 
 /**
- * Create multiple bookings for selected hours with atomic conflict check and rate limiting
+ * Create multiple bookings (multi-slot)
  */
 export async function createMultipleBookings({
+  facilityId,
   fieldId,
   dateString,
   slots,
   playerName,
   playerPhone,
+  participantsCount = 1,
   userId = null,
   bookingSource = 'online',
   notes = '',
 }) {
   await expireStaleBookings();
+
+  const targetId = facilityId || fieldId;
+  const resolved = await resolveFacilityOrField(targetId);
+  if (!resolved) {
+    const err = new Error('المنشأة أو الملعب غير موجود');
+    err.statusCode = 404;
+    throw err;
+  }
+
+  const { target, venue, bookingType, capacity, activityType } = resolved;
+  const count = Math.max(1, parseInt(participantsCount, 10) || 1);
 
   if (bookingSource === 'online') {
     const pendingCount = await Booking.countDocuments({
@@ -239,7 +376,7 @@ export async function createMultipleBookings({
       status: 'pending_confirmation',
     });
     if (pendingCount >= 3) {
-      const error = new Error('لديك 3 حجوزات معلقة بانتظار التأكيد، يرجى تأكيدها أولاً قبل إكمال الحجز');
+      const error = new Error('لديك 3 حجوزات معلقة بانتظار التأكيد، يرجى تأكيدها أولاً');
       error.statusCode = 400;
       throw error;
     }
@@ -247,45 +384,54 @@ export async function createMultipleBookings({
 
   const startTimes = slots.map((s) => (typeof s === 'string' ? s : s.startTime));
 
-  // Check if any requested slot is already booked
+  // Check conflicts for all slots
   const existingBookings = await Booking.find({
-    field: fieldId,
+    $or: [{ facility: target._id }, { field: target._id }],
     dateString,
     startTime: { $in: startTimes },
     status: { $nin: ['cancelled', 'auto_expired'] },
   });
 
-  if (existingBookings.length > 0) {
-    const bookedTimes = existingBookings.map((b) => b.startTime).join(', ');
-    const error = new Error(`بعض الساعات المختارة تم حجزها بالفعل (${bookedTimes})، يرجى اختيار مواعيد أخرى`);
+  if (bookingType !== 'session' && existingBookings.length > 0) {
+    const conflictSlot = existingBookings[0].startTime;
+    const error = new Error(`أحد المواعيد المحددة (${conflictSlot}) تم حجزه بالفعل`);
     error.statusCode = 409;
     throw error;
   }
 
-  const createdBookings = [];
-  let totalPrice = 0;
-  // Shared token and batchId for multi-slot booking session
-  const sharedToken = bookingSource === 'dashboard_manual' ? null : crypto.randomBytes(12).toString('hex');
   const batchId = 'batch_' + Date.now() + '_' + crypto.randomBytes(4).toString('hex');
+  const createdBookings = [];
+  let totalBatchPrice = 0;
 
   for (const slot of slots) {
-    const startTime = typeof slot === 'string' ? slot : slot.startTime;
-    const endTime = typeof slot === 'object' && slot.endTime ? slot.endTime : null;
-    const { price } = await calculateSlotPrice(fieldId, dateString, startTime);
-    totalPrice += price;
+    const slotStartTime = typeof slot === 'string' ? slot : slot.startTime;
+    const slotEndTime = typeof slot === 'string' ? null : slot.endTime;
 
-    const policy = getConfirmationPolicyDetails(dateString, startTime, bookingSource);
-    if (sharedToken) policy.confirmationToken = sharedToken;
+    // Calculate end time if not given
+    const calculatedEndTime =
+      slotEndTime ||
+      `${String(parseInt(slotStartTime.split(':')[0], 10) + 1).padStart(2, '0')}:${slotStartTime.split(':')[1]}`;
 
-    const newBooking = await Booking.create({
-      field: fieldId,
+    const { price: unitPrice } = await calculateSlotPrice(target._id, dateString, slotStartTime);
+    const totalPrice = bookingType === 'session' ? unitPrice * count : unitPrice;
+    totalBatchPrice += totalPrice;
+
+    const policy = getConfirmationPolicyDetails(dateString, slotStartTime, bookingSource);
+
+    const bookingDoc = await Booking.create({
+      venue: venue ? venue._id : null,
+      facility: resolved.isFacility ? target._id : null,
+      field: !resolved.isFacility ? target._id : null,
+      activityType,
+      bookingType,
+      participantsCount: count,
       user: userId,
       dateString,
-      startTime,
-      endTime: endTime || slot.endTime,
+      startTime: slotStartTime,
+      endTime: calculatedEndTime,
       playerName,
       playerPhone,
-      price,
+      price: totalPrice,
       bookingSource,
       notes,
       batchId,
@@ -296,75 +442,72 @@ export async function createMultipleBookings({
       paymentStatus: 'pending',
     });
 
-    createdBookings.push(newBooking);
+    createdBookings.push(bookingDoc);
   }
 
-  createdBookings.sort((a, b) => a.startTime.localeCompare(b.startTime));
-  const mainBooking = createdBookings[0];
-
   return {
+    batchId,
+    totalPrice: totalBatchPrice,
+    bookingsCount: createdBookings.length,
     bookings: createdBookings,
-    booking: {
-      _id: createdBookings.map((b) => b._id.toString().slice(-4)).join('-'),
-      playerName,
-      playerPhone,
-      dateString,
-      startTime: createdBookings[0].startTime,
-      endTime: createdBookings[createdBookings.length - 1].endTime,
-      price: totalPrice,
-      status: mainBooking.status,
-      confirmationToken: mainBooking.confirmationToken,
-      confirmationDeadline: mainBooking.confirmationDeadline,
-      totalSlots: createdBookings.length,
-      slotsList: createdBookings.map((b) => `${b.startTime} - ${b.endTime}`),
-    },
-    totalPrice,
-    count: createdBookings.length,
+    booking: createdBookings[0],
   };
 }
 
 /**
- * Confirm booking using token
+ * Confirm a booking or batch by token
  */
 export async function confirmBookingByToken(token) {
-  await expireStaleBookings();
-
-  const bookings = await Booking.find({ confirmationToken: token });
-  if (!bookings || bookings.length === 0) {
-    const error = new Error('رابط التأكيد غير صحيح أو غير موجود');
+  const primaryBooking = await Booking.findOne({ confirmationToken: token });
+  if (!primaryBooking) {
+    const error = new Error('رمز التأكيد غير صالح أو منتهي الصلاحية');
     error.statusCode = 404;
     throw error;
   }
 
-  const firstBooking = bookings[0];
-
-  if (firstBooking.status === 'confirmed') {
+  if (primaryBooking.status === 'confirmed') {
     return {
-      message: 'هذا الحجز مؤكد بالفعل سابقاً',
-      bookings,
+      alreadyConfirmed: true,
+      message: 'تم تأكيد هذا الحجز بالفعل في وقت سابق',
+      booking: primaryBooking,
     };
   }
 
-  if (firstBooking.status === 'auto_expired' || firstBooking.status === 'cancelled') {
-    const error = new Error('عذراً، انتهت مهلة تأكيد هذا الحجز أو تم إلغاؤه');
+  if (primaryBooking.status === 'cancelled' || primaryBooking.status === 'auto_expired') {
+    const error = new Error('عذراً، تم إلغاء هذا الحجز مسبقاً أو انتهت مهلة تأكيده');
     error.statusCode = 400;
     throw error;
   }
 
   const now = new Date();
-  await Booking.updateMany(
-    { confirmationToken: token },
-    {
-      $set: {
-        status: 'confirmed',
-        confirmedAt: now,
-      },
-    }
-  );
+  if (primaryBooking.confirmationDeadline && primaryBooking.confirmationDeadline < now) {
+    primaryBooking.status = 'auto_expired';
+    await primaryBooking.save();
+    const error = new Error('عذراً، انتهت المهلة المحددة لتأكيد الحجز');
+    error.statusCode = 400;
+    throw error;
+  }
 
-  const updatedBookings = await Booking.find({ confirmationToken: token }).populate('field');
+  // Update all bookings in this batch
+  const updateFilter = primaryBooking.batchId
+    ? { batchId: primaryBooking.batchId, status: 'pending_confirmation' }
+    : { _id: primaryBooking._id };
+
+  await Booking.updateMany(updateFilter, {
+    $set: {
+      status: 'confirmed',
+      confirmedAt: now,
+    },
+  });
+
+  const updatedBooking = await Booking.findById(primaryBooking._id)
+    .populate('venue')
+    .populate('facility')
+    .populate('field');
+
   return {
-    message: 'تم تأكيد وتثبيت الحجز بنجاح',
-    bookings: updatedBookings,
+    alreadyConfirmed: false,
+    message: 'تم تأكيد حجزك بنجاح! ننتظرك في الموعد المحدد.',
+    booking: updatedBooking,
   };
 }

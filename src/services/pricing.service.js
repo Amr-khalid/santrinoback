@@ -1,29 +1,34 @@
 import PricingRule from '../models/PricingRule.js';
+import Facility from '../models/Facility.js';
 import Field from '../models/Field.js';
 import { isTimeInRange } from '../utils/timeSlots.js';
 
 /**
- * Calculate dynamic price for a specific slot on a given date
- * @param {string} fieldId
+ * Calculate dynamic price for a specific slot/session on a given date
+ * @param {string} targetId - Facility ID or Field ID
  * @param {string} dateString - "YYYY-MM-DD"
  * @param {string} startTime - "18:00"
  * @returns {Promise<{price: number, appliedRule: object | null}>}
  */
-export async function calculateSlotPrice(fieldId, dateString, startTime) {
+export async function calculateSlotPrice(targetId, dateString, startTime) {
   const date = new Date(dateString);
   const dayOfWeek = date.getDay(); // 0 = Sun, 1 = Mon, ..., 5 = Fri, 6 = Sat
 
-  // Fetch field for default price
-  const field = await Field.findById(fieldId);
-  if (!field) {
-    throw new Error('الملعب غير موجود');
+  // Check Facility first, then fallback to Field
+  let target = await Facility.findById(targetId);
+  if (!target) {
+    target = await Field.findById(targetId);
   }
 
-  // Fetch active rules for this field
+  if (!target) {
+    throw new Error('المنشأة أو الملعب غير موجود');
+  }
+
+  // Fetch active rules for this facility / field
   const rules = await PricingRule.find({
-    field: fieldId,
+    $or: [{ facility: targetId }, { field: targetId }],
     isActive: true,
-  }).sort({ priority: -1 }); // Highest priority first
+  }).sort({ priority: -1 });
 
   for (const rule of rules) {
     // Check if day matches
@@ -42,12 +47,12 @@ export async function calculateSlotPrice(fieldId, dateString, startTime) {
     }
   }
 
-  // Fallback to default field day (150) / night (200) price
+  // Fallback to default day / night price
   const hour = parseInt(startTime.split(':')[0], 10);
   const isNight = hour >= 18 || hour < 6; // 6 PM to 6 AM
   const fallbackPrice = isNight
-    ? (field.defaultNightPrice !== undefined ? field.defaultNightPrice : 200)
-    : (field.defaultDayPrice !== undefined ? field.defaultDayPrice : 150);
+    ? (target.defaultNightPrice !== undefined ? target.defaultNightPrice : (target.defaultHourlyPrice || 200))
+    : (target.defaultDayPrice !== undefined ? target.defaultDayPrice : (target.defaultHourlyPrice || 150));
 
   return {
     price: fallbackPrice,
@@ -58,4 +63,3 @@ export async function calculateSlotPrice(fieldId, dateString, startTime) {
     },
   };
 }
-

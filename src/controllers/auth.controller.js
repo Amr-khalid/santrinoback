@@ -43,6 +43,26 @@ export const register = async (req, res, next) => {
       role: role || 'player',
     });
 
+    // If registered as owner, automatically initialize their Venue
+    if (user.role === 'owner') {
+      try {
+        const Venue = (await import('../models/Venue.js')).default;
+        await Venue.create({
+          name: `منشأة ${cleanName} الرياضية`,
+          owner: user._id,
+          description: `منشأة وملاعب رياضية متكاملة`,
+          location: {
+            address: 'القاهرة الجديدة',
+            city: 'القاهرة الجديدة',
+          },
+          phone: cleanPhone,
+          activities: ['padel', 'football'],
+        });
+      } catch (venueErr) {
+        console.warn('Failed to auto-create venue for owner:', venueErr.message);
+      }
+    }
+
     const token = generateToken(user._id);
 
     res.status(201).json({

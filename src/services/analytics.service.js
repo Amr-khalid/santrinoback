@@ -1,16 +1,25 @@
 import Booking from '../models/Booking.js';
+import Facility from '../models/Facility.js';
 import Field from '../models/Field.js';
 import { generateTimeSlots } from '../utils/timeSlots.js';
 
 /**
- * Get dashboard overview statistics for an owner's field
+ * Get dashboard overview statistics across owner's facilities / venue
  */
-export async function getDashboardStats(fieldId) {
+export async function getDashboardStats({ venueId, facilityIds = [], fieldId = null }) {
   const todayStr = new Date().toISOString().split('T')[0];
+
+  // Build query to catch any booking under this venue or facilities or legacy field
+  const orConditions = [];
+  if (venueId) orConditions.push({ venue: venueId });
+  if (facilityIds.length > 0) orConditions.push({ facility: { $in: facilityIds } });
+  if (fieldId) orConditions.push({ field: fieldId });
+
+  const baseFilter = orConditions.length > 0 ? { $or: orConditions } : {};
 
   // Today's bookings
   const todayBookings = await Booking.find({
-    field: fieldId,
+    ...baseFilter,
     dateString: todayStr,
     status: { $ne: 'cancelled' },
   });
@@ -18,17 +27,36 @@ export async function getDashboardStats(fieldId) {
   const todayRevenue = todayBookings.reduce((sum, b) => sum + (b.price || 0), 0);
   const todayCount = todayBookings.length;
 
-  // Calculate field total slots per day
-  const field = await Field.findById(fieldId);
-  const totalSlotsPerDay = field
-    ? generateTimeSlots(field.operatingHours.open, field.operatingHours.close, field.slotDurationMinutes).length
-    : 12;
+  // Calculate total slots per day across all active facilities
+  let totalDailySlots = 0;
+  if (facilityIds.length > 0) {
+    const facilities = await Facility.find({ _id: { $in: facilityIds }, isActive: true });
+    facilities.forEach((f) => {
+      const slots = generateTimeSlots(
+        f.operatingHours?.open || '08:00',
+        f.operatingHours?.close || '24:00',
+        f.slotDurationMinutes || 60
+      );
+      totalDailySlots += slots.length;
+    });
+  } else if (fieldId) {
+    const field = await Field.findById(fieldId);
+    if (field) {
+      totalDailySlots = generateTimeSlots(
+        field.operatingHours?.open || '08:00',
+        field.operatingHours?.close || '24:00',
+        field.slotDurationMinutes || 60
+      ).length;
+    }
+  }
 
-  const todayOccupancy = totalSlotsPerDay > 0 ? Math.round((todayCount / totalSlotsPerDay) * 100) : 0;
+  if (totalDailySlots === 0) totalDailySlots = 12;
 
-  // All time / Month stats
+  const todayOccupancy = Math.min(100, Math.round((todayCount / totalDailySlots) * 100));
+
+  // All time stats
   const allBookings = await Booking.find({
-    field: fieldId,
+    ...baseFilter,
     status: { $ne: 'cancelled' },
   });
 
@@ -41,7 +69,6 @@ export async function getDashboardStats(fieldId) {
     const d = new Date();
     d.setDate(d.getDate() - i);
     const dStr = d.toISOString().split('T')[0];
-
     const dayNameAr = new Intl.DateTimeFormat('ar-EG', { weekday: 'short' }).format(d);
 
     const dayBookings = allBookings.filter((b) => b.dateString === dStr);
@@ -56,7 +83,9 @@ export async function getDashboardStats(fieldId) {
   }
 
   // Recent 10 bookings
-  const recentBookings = await Booking.find({ field: fieldId })
+  const recentBookings = await Booking.find(baseFilter)
+    .populate('venue', 'name')
+    .populate('facility', 'name activityType')
     .sort({ createdAt: -1 })
     .limit(10);
 
@@ -66,7 +95,7 @@ export async function getDashboardStats(fieldId) {
       bookingsCount: todayCount,
       revenue: todayRevenue,
       occupancyRate: todayOccupancy,
-      totalSlots: totalSlotsPerDay,
+      totalSlots: totalDailySlots,
     },
     total: {
       bookingsCount: totalBookingsCount,
